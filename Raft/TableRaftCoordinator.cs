@@ -179,6 +179,23 @@ var currentPeers = _members.Values.Where(peer => peer.NodeId != _options.NodeId)
             catch (TaskCanceledException) when (!cancellationToken.IsCancellationRequested) { }
         }
     }
+
+    public async Task EnsureVectorTableOnPeersAsync(string table, VectorTableSchema schema, CancellationToken cancellationToken = default)
+    {
+        var normalized = TableNames.Normalize(table);
+        foreach (var peer in _members.Values)
+        {
+            try
+            {
+                using var response = await _httpClient.PutAsJsonAsync(
+                    $"{peer.Url.TrimEnd('/')}/tables/{Uri.EscapeDataString(normalized)}/vector",
+                    schema with { Table = normalized }, cancellationToken);
+                response.EnsureSuccessStatusCode();
+            }
+            catch (HttpRequestException) { }
+            catch (TaskCanceledException) when (!cancellationToken.IsCancellationRequested) { }
+        }
+    }
     public async Task EnsureSearchIndexOnPeersAsync(string name, string table, IReadOnlyList<string> fields, CancellationToken cancellationToken = default)
     {
         if (!_options.Enabled) return;

@@ -41,7 +41,7 @@ internal sealed record SqlRollbackStatement() : SqlStatement("ROLLBACK");
 
 internal sealed record SqlShowTablesStatement() : SqlStatement("SHOW TABLES");
 
-internal sealed record SqlCreateTableStatement(string Table, RelationalTableSchema? Schema = null) : SqlStatement(Schema is null ? "CREATE TABLE" : "CREATE RELATIONAL TABLE");
+internal sealed record SqlCreateTableStatement(string Table, RelationalTableSchema? Schema = null, VectorTableSchema? VectorSchema = null) : SqlStatement(VectorSchema is not null ? "CREATE VECTOR TABLE" : Schema is null ? "CREATE TABLE" : "CREATE RELATIONAL TABLE");
 
 internal sealed record SqlDropTableStatement(string Table, bool IfExists = false) : SqlStatement("DROP TABLE");
 

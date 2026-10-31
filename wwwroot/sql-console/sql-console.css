@@ -153,6 +153,16 @@ button:disabled {
   white-space: normal;
 }
 
+.snippet.vector {
+  border-color: #b9e6c6;
+  background: #f1fbf4;
+}
+
+.snippet.vector:hover {
+  border-color: #62b879;
+  background: #e7f7eb;
+}
+
 .history {
   flex: 1;
   overflow: auto;

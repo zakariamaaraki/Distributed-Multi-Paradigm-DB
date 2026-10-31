@@ -84,6 +84,20 @@ public static class TableEndpoints
                 return Results.BadRequest(new { error = ex.Message });
             }
         });
+
+        app.MapPut("/tables/{table}/vector", async (string table, VectorTableSchema schema, DatabaseEngine db, TableRaftCoordinator coordinator, CancellationToken cancellationToken) =>
+        {
+            try
+            {
+                var normalized = TableNames.Normalize(table);
+                if (!string.Equals(normalized, TableNames.Normalize(schema.Table), StringComparison.Ordinal))
+                    return Results.BadRequest(new { error = "route table and schema table must match" });
+                await db.CreateVectorTableAsync(schema with { Table = normalized }, cancellationToken);
+                await coordinator.EnsureTableAsync(normalized, cancellationToken);
+                return Results.Ok(new { table = normalized, kind = "vector" });
+            }
+            catch (ArgumentException ex) { return Results.BadRequest(new { error = ex.Message }); }
+        });
         app.MapGet("/views/{view}", async (string view, DatabaseEngine db, CancellationToken cancellationToken) =>
         {
             var definition = await db.GetViewAsync(view, cancellationToken);

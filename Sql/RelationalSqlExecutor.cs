@@ -37,7 +37,13 @@ internal sealed class RelationalSqlExecutor
         var table = tableMatch.Groups["table"].Value.ToLowerInvariant();
         var schema = await _database.GetRelationalSchemaAsync(table);
         if (schema is null)
+        {
+            if (keyword == "SELECT"
+                && await _database.GetVectorSchemaAsync(table) is not null
+                && Regex.IsMatch(sql, @"\bORDER\s+BY\b", RegexOptions.IgnoreCase))
+                return await VectorSelectAsync(sql, table);
             return null;
+        }
         if (keyword == "INSERT" && sql.Contains("{", StringComparison.Ordinal))
             return null;
         if (keyword is "SELECT" or "UPDATE" or "DELETE" && (Regex.IsMatch(sql, @"\bkey\b", RegexOptions.IgnoreCase) || Regex.IsMatch(sql, @"\bvalue\b", RegexOptions.IgnoreCase)))
@@ -50,6 +56,36 @@ internal sealed class RelationalSqlExecutor
             "DELETE" => await DeleteAsync(sql, table, schema, transactionId),
             _ => null
         };
+    }
+
+    private async Task<SqlExecutionResult> VectorSelectAsync(string sql, string table)
+    {
+        var match = Regex.Match(sql,
+            @"^\s*SELECT\s+(?<columns>.*?)\s+FROM\s+\w+\s+ORDER\s+BY\s+(?<column>\w+)\s*<->\s*'(?<vector>(?:''|[^'])*)'\s+LIMIT\s+(?<limit>\d+)\s*;?\s*$",
+            RegexOptions.IgnoreCase | RegexOptions.Singleline);
+        if (!match.Success) throw new SqlExecutionException("Vector search syntax is SELECT key, value FROM table ORDER BY embedding <-> '[...]' LIMIT k.");
+        var schema = await _database.GetVectorSchemaAsync(table) ?? throw new SqlExecutionException($"Table '{table}' is not a vector table.");
+        if (!string.Equals(match.Groups["column"].Value, schema.EmbeddingColumn, StringComparison.OrdinalIgnoreCase))
+            throw new SqlExecutionException($"Vector search must order by '{schema.EmbeddingColumn}'.");
+        if (!int.TryParse(match.Groups["limit"].Value, NumberStyles.None, CultureInfo.InvariantCulture, out var limit) || limit is < 1 or > 10_000)
+            throw new SqlExecutionException("Vector search LIMIT must be between 1 and 10000.");
+        double[] query;
+        try { query = schema.ReadVector("{\"" + schema.EmbeddingColumn + "\":" + match.Groups["vector"].Value.Replace("''", "'") + "}"); }
+        catch (ArgumentException ex) { throw new SqlExecutionException(ex.Message); }
+        var nearest = await _database.SearchVectorsAsync(table, query, limit, Math.Max(64, limit));
+        var rows = new List<IReadOnlyDictionary<string, string>>();
+        foreach (var item in nearest)
+        {
+            var row = await _database.GetAsync(table, item.Id);
+            if (row is null) continue;
+            rows.Add(new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["key"] = row.Key,
+                ["value"] = row.Value,
+                ["distance"] = item.Distance.ToString("R", CultureInfo.InvariantCulture)
+            });
+        }
+        return SqlExecutionResult.WithRows("VECTOR SEARCH", rows);
     }
 
     private async Task<SqlExecutionResult> InsertAsync(string sql, string table, RelationalTableSchema schema, Guid? transactionId)

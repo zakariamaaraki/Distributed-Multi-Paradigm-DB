@@ -14,7 +14,7 @@
         <div class="mark">SQL</div>
         <div>
           <h1>LsmWriteDb Console</h1>
-          <span>ANSI SQL + key/value workspace</span>
+          <span>ANSI SQL + vectors + key/value workspace</span>
         </div>
       </div>
 
@@ -46,7 +46,13 @@
 
       <section class="sidebar-section">
         <span class="label">Suggested queries</span>
+        <p class="field-help">Vector quickstart: click each Vector example in order and press Run. The last query returns nearest rows with cosine distance.</p>
         <div class="query-list">
+          <button class="snippet vector" data-query="CREATE TABLE VECTOR demo_vectors (embedding VECTOR(3))">Vector 1: CREATE TABLE VECTOR demo_vectors (embedding VECTOR(3))</button>
+          <button class="snippet vector" data-query="INSERT INTO demo_vectors VALUES ('item-1', '{&quot;embedding&quot;:[1,0,0],&quot;label&quot;:&quot;matched&quot;}')">Vector 2: insert [1,0,0]</button>
+          <button class="snippet vector" data-query="INSERT INTO demo_vectors VALUES ('item-2', '{&quot;embedding&quot;:[0.98,0.2,0],&quot;label&quot;:&quot;close match&quot;}')">Vector 3: insert [0.98,0.2,0]</button>
+          <button class="snippet vector" data-query="INSERT INTO demo_vectors VALUES ('item-3', '{&quot;embedding&quot;:[0,1,0],&quot;label&quot;:&quot;different direction&quot;}')">Vector 4: insert [0,1,0]</button>
+          <button class="snippet vector" data-query="SELECT key, value FROM demo_vectors ORDER BY embedding &lt;-&gt; '[1,0,0]' LIMIT 3">Vector 5: nearest to [1,0,0]</button>
           <button class="snippet" data-query="SHOW TABLES">SHOW TABLES</button>
           <button class="snippet ansi" data-query="CREATE TABLE relational_users (id INTEGER PRIMARY KEY, name VARCHAR(255) NOT NULL, active BOOLEAN)">ANSI: CREATE TABLE relational_users (...)</button>
           <button class="snippet ansi" data-query="INSERT INTO relational_users (id, name, active) VALUES (42, 'Ada', TRUE)">ANSI: INSERT INTO relational_users (...) VALUES (...)</button>

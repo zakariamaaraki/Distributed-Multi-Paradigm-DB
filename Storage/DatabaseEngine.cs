@@ -95,6 +95,8 @@ public sealed class DatabaseEngine
     private readonly DatabaseSequenceGenerator _sequenceGenerator = new();
     private readonly ConcurrentDictionary<string, LsmStore> _stores = new(StringComparer.Ordinal);
     private readonly Dictionary<string, RelationalTableSchema> _relationalSchemas = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, VectorTableSchema> _vectorSchemas = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, LsmWriteDb.Indexes.HnswIndex> _vectorIndexes = new(StringComparer.Ordinal);
     private readonly Dictionary<string, ViewDefinition> _views = new(StringComparer.Ordinal);
     private readonly JsonValueIndexStore _indexes;
     private readonly SstableValueIndexStore _sstableIndexes;
@@ -133,6 +135,8 @@ public sealed class DatabaseEngine
             var tableNames = catalog.Tables.Select(TableNames.Normalize).ToHashSet(StringComparer.Ordinal);
             foreach (var schema in catalog.RelationalTables ?? [])
                 _relationalSchemas[TableNames.Normalize(schema.Table)] = schema with { Table = TableNames.Normalize(schema.Table) };
+            foreach (var schema in catalog.VectorTables ?? [])
+                _vectorSchemas[TableNames.Normalize(schema.Table)] = schema with { Table = TableNames.Normalize(schema.Table) };
             foreach (var view in catalog.Views ?? [])
             {
                 var normalizedView = TableNames.Normalize(view.Name);
@@ -151,6 +155,15 @@ public sealed class DatabaseEngine
             {
                 var store = GetOrCreateStoreCore(table);
                 await store.InitializeAsync();
+            }
+
+            foreach (var schema in _vectorSchemas.Values)
+            {
+                schema.ValidateDefinition();
+                var index = new LsmWriteDb.Indexes.HnswIndex(schema.Dimensions);
+                foreach (var row in await ScanTableRowsForIndexAsync(schema.Table))
+                    index.Upsert(row.Key, schema.ReadVector(row.Value));
+                _vectorIndexes[schema.Table] = index;
             }
 
             await WriteCatalogAsync(_stores.Keys.OrderBy(name => name, StringComparer.Ordinal).ToList(), cancellationToken);
@@ -179,7 +192,7 @@ public sealed class DatabaseEngine
                 name,
                 string.Equals(name, TableNames.Default, StringComparison.Ordinal)
                     ? "kv"
-                    : _relationalSchemas.ContainsKey(name) ? "relational" : "document"))
+                    : _vectorSchemas.ContainsKey(name) ? "vector" : _relationalSchemas.ContainsKey(name) ? "relational" : "document"))
             .Concat(_views.Values.Where(view => !TableNames.IsInternal(view.Name)).Select(view => new TableInfo(view.Name, "view")))
             .OrderBy(table => table.Name, StringComparer.Ordinal)
             .ToList();
@@ -193,7 +206,7 @@ public sealed class DatabaseEngine
                 name,
                 string.Equals(name, TableNames.Default, StringComparison.Ordinal)
                     ? "kv"
-                    : _relationalSchemas.ContainsKey(name) ? "relational" : "document")).ToList();
+                : _vectorSchemas.ContainsKey(name) ? "vector" : _relationalSchemas.ContainsKey(name) ? "relational" : "document")).ToList();
     }
     public async Task<bool> CreateTableAsync(string table, CancellationToken cancellationToken = default)
     {
@@ -205,6 +218,25 @@ public sealed class DatabaseEngine
         schema.ValidateDefinition();
         var normalized = TableNames.Normalize(schema.Table);
         return await CreateTableCoreAsync(normalized, schema with { Table = normalized }, cancellationToken);
+    }
+
+    public async Task<bool> CreateVectorTableAsync(VectorTableSchema schema, CancellationToken cancellationToken = default)
+    {
+        schema.ValidateDefinition();
+        var normalized = TableNames.Normalize(schema.Table);
+        await EnsureInitializedAsync(cancellationToken);
+        await _catalogMutex.WaitAsync(cancellationToken);
+        try
+        {
+            if (_stores.ContainsKey(normalized)) return false;
+            var store = GetOrCreateStoreCore(normalized);
+            await store.InitializeAsync();
+            _vectorSchemas[normalized] = schema with { Table = normalized };
+            _vectorIndexes[normalized] = new LsmWriteDb.Indexes.HnswIndex(schema.Dimensions);
+            await WriteCatalogAsync(_stores.Keys.OrderBy(name => name, StringComparer.Ordinal).ToList(), cancellationToken);
+            return true;
+        }
+        finally { _catalogMutex.Release(); }
     }
 
     public async Task<bool> DropTableAsync(string table, CancellationToken cancellationToken = default)
@@ -226,6 +258,8 @@ public sealed class DatabaseEngine
             {
                 await store.DeleteDataAsync();
                 _relationalSchemas.Remove(normalized);
+                _vectorSchemas.Remove(normalized);
+                _vectorIndexes.Remove(normalized);
                 await _indexes.RemoveTableAsync(normalized, cancellationToken);
                 await _search.RemoveTableAsync(normalized, cancellationToken);
                 await _sstableIndexes.RemoveTableAsync(normalized, cancellationToken);
@@ -279,11 +313,28 @@ public sealed class DatabaseEngine
         return schema;
     }
 
+    public async Task<VectorTableSchema?> GetVectorSchemaAsync(string table, CancellationToken cancellationToken = default)
+    {
+        await EnsureInitializedAsync(cancellationToken);
+        _vectorSchemas.TryGetValue(TableNames.Normalize(table), out var schema);
+        return schema;
+    }
+
+    public async Task<IReadOnlyList<(string Id, double Distance)>> SearchVectorsAsync(string table, IReadOnlyList<double> query, int k, int efSearch = 64)
+    {
+        await EnsureInitializedAsync();
+        var normalized = TableNames.Normalize(table);
+        if (!_vectorIndexes.TryGetValue(normalized, out var index)) throw new ArgumentException($"Table '{normalized}' is not a vector table.");
+        return index.Search(query, k, efSearch);
+    }
+
     public async Task ValidateWriteAsync(string table, string key, string value, CancellationToken cancellationToken = default)
     {
         await EnsureInitializedAsync(cancellationToken);
         if (_relationalSchemas.TryGetValue(TableNames.Normalize(table), out var schema))
             schema.ValidateRow(key, value);
+        if (_vectorSchemas.TryGetValue(TableNames.Normalize(table), out var vectorSchema))
+            vectorSchema.ReadVector(value);
     }
 
     private async Task<bool> CreateTableCoreAsync(string table, RelationalTableSchema? schema, CancellationToken cancellationToken)
@@ -403,9 +454,11 @@ public sealed class DatabaseEngine
     }
     public async Task PutAsync(string table, string key, string value)
     {
+        await ValidateWriteAsync(table, key, value);
         var store = await GetStoreAsync(table);
         var oldRow = await store.GetAsync(key);
         await store.PutAsync(key, value);
+        ApplyVectorPut(TableNames.Normalize(table), key, value);
         await _indexes.ApplyPutAsync(TableNames.Normalize(table), key, oldRow?.Value, value);
         await _search.ApplyPutAsync(TableNames.Normalize(table), key, oldRow?.Value, value);
         await _sstableIndexes.ApplyPutAsync(TableNames.Normalize(table), key, oldRow?.Value, value);
@@ -416,6 +469,7 @@ public sealed class DatabaseEngine
         var store = await GetStoreAsync(table);
         var oldRow = await store.GetAsync(key);
         await store.DeleteAsync(key);
+        if (_vectorIndexes.TryGetValue(TableNames.Normalize(table), out var vectorIndex)) vectorIndex.Remove(key);
         await _indexes.ApplyDeleteAsync(TableNames.Normalize(table), key, oldRow?.Value);
         await _search.ApplyDeleteAsync(TableNames.Normalize(table), key, oldRow?.Value);
         await _sstableIndexes.ApplyDeleteAsync(TableNames.Normalize(table), key, oldRow?.Value);
@@ -469,12 +523,14 @@ public sealed class DatabaseEngine
             {
                 if (operation.IsDeleted)
                 {
+                    if (_vectorIndexes.TryGetValue(group.Key, out var vectorIndex)) vectorIndex.Remove(operation.Key);
                     await _indexes.ApplyDeleteAsync(group.Key, operation.Key, oldRowsByKey[operation.Key]);
                     await _search.ApplyDeleteAsync(group.Key, operation.Key, oldRowsByKey[operation.Key]);
                     await _sstableIndexes.ApplyDeleteAsync(group.Key, operation.Key, oldRowsByKey[operation.Key]);
                 }
                 else
                 {
+                    ApplyVectorPut(group.Key, operation.Key, operation.Value ?? string.Empty);
                     await _indexes.ApplyPutAsync(group.Key, operation.Key, oldRowsByKey[operation.Key], operation.Value ?? string.Empty);
                     await _search.ApplyPutAsync(group.Key, operation.Key, oldRowsByKey[operation.Key], operation.Value ?? string.Empty);
                     await _sstableIndexes.ApplyPutAsync(group.Key, operation.Key, oldRowsByKey[operation.Key], operation.Value ?? string.Empty);
@@ -488,6 +544,8 @@ public sealed class DatabaseEngine
         await EnsureInitializedAsync();
 
         var table = TableNames.Normalize(entry.Table);
+        if (!entry.IsDeleted)
+            await ValidateWriteAsync(table, entry.Key, entry.Value ?? string.Empty);
         if (!_stores.ContainsKey(table))
         {
             await CreateTableAsync(table);
@@ -499,12 +557,14 @@ public sealed class DatabaseEngine
 
         if (entry.IsDeleted)
         {
+            if (_vectorIndexes.TryGetValue(table, out var vectorIndex)) vectorIndex.Remove(entry.Key);
             await _indexes.ApplyDeleteAsync(table, entry.Key, oldRow?.Value);
             await _search.ApplyDeleteAsync(table, entry.Key, oldRow?.Value);
             await _sstableIndexes.ApplyDeleteAsync(table, entry.Key, oldRow?.Value);
         }
         else
         {
+            ApplyVectorPut(table, entry.Key, entry.Value ?? string.Empty);
             await _indexes.ApplyPutAsync(table, entry.Key, oldRow?.Value, entry.Value ?? string.Empty);
             await _search.ApplyPutAsync(table, entry.Key, oldRow?.Value, entry.Value ?? string.Empty);
             await _sstableIndexes.ApplyPutAsync(table, entry.Key, oldRow?.Value, entry.Value ?? string.Empty);
@@ -580,6 +640,12 @@ public sealed class DatabaseEngine
         throw new TableNotFoundException(table);
     }
 
+    private void ApplyVectorPut(string table, string key, string value)
+    {
+        if (_vectorSchemas.TryGetValue(table, out var schema) && _vectorIndexes.TryGetValue(table, out var index))
+            index.Upsert(key, schema.ReadVector(value));
+    }
+
     private LsmStore GetOrCreateStoreCore(string table)
     {
         var normalized = TableNames.Normalize(table);
@@ -621,7 +687,7 @@ public sealed class DatabaseEngine
     private async Task WriteCatalogAsync(IReadOnlyList<string> tables, CancellationToken cancellationToken)
     {
         Directory.CreateDirectory(_options.DataPath);
-        var snapshot = new TableCatalogSnapshot(tables, _relationalSchemas.Values.OrderBy(schema => schema.Table, StringComparer.Ordinal).ToList(), _views.Values.OrderBy(view => view.Name, StringComparer.Ordinal).ToList());
+        var snapshot = new TableCatalogSnapshot(tables, _relationalSchemas.Values.OrderBy(schema => schema.Table, StringComparer.Ordinal).ToList(), _views.Values.OrderBy(view => view.Name, StringComparer.Ordinal).ToList(), _vectorSchemas.Values.OrderBy(schema => schema.Table, StringComparer.Ordinal).ToList());
         var json = JsonSerializer.Serialize(snapshot, JsonOptions);
         await File.WriteAllTextAsync(_catalogPath, json, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false), cancellationToken);
     }
@@ -669,4 +735,4 @@ internal sealed class DatabaseSequenceGenerator : IStoreSequenceGenerator
 
 public sealed record ViewDefinition(string Name, string Query, string Kind = "view");
 
-internal sealed record TableCatalogSnapshot(IReadOnlyList<string> Tables, IReadOnlyList<RelationalTableSchema>? RelationalTables = null, IReadOnlyList<ViewDefinition>? Views = null);
+internal sealed record TableCatalogSnapshot(IReadOnlyList<string> Tables, IReadOnlyList<RelationalTableSchema>? RelationalTables = null, IReadOnlyList<ViewDefinition>? Views = null, IReadOnlyList<VectorTableSchema>? VectorTables = null);

@@ -147,6 +147,7 @@ internal sealed class SqlParser
 
         if (MatchKeyword("TABLE"))
         {
+            if (MatchKeyword("VECTOR")) return ParseCreateVectorTable();
             return ParseCreateTable();
         }
 
@@ -233,6 +234,22 @@ internal sealed class SqlParser
         try { schema.ValidateDefinition(); }
         catch (RelationalSchemaException ex) { throw new SqlParseException(ex.Message); }
         return new SqlCreateTableStatement(table, schema);
+    }
+
+    private SqlCreateTableStatement ParseCreateVectorTable()
+    {
+        var table = ExpectTableName();
+        ExpectSymbol("(");
+        var embeddingColumn = ExpectIdentifier().ToLowerInvariant();
+        ExpectKeyword("VECTOR");
+        ExpectSymbol("(");
+        var dimensions = ExpectPositiveNumber();
+        ExpectSymbol(")");
+        ExpectSymbol(")");
+        var schema = new VectorTableSchema(table, embeddingColumn, dimensions);
+        try { schema.ValidateDefinition(); }
+        catch (ArgumentException ex) { throw new SqlParseException(ex.Message); }
+        return new SqlCreateTableStatement(table, VectorSchema: schema);
     }
     private SqlCreateIndexStatement ParseCreateIndex()
     {

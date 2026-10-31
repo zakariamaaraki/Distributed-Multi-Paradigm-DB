@@ -498,15 +498,19 @@ public sealed class SqlEngine
             return SqlExecutionResult.Acknowledged("CREATE TABLE", rowsAffected: 0, message: "table already exists");
         }
 
-        var created = statement.Schema is null
-            ? await _database.CreateTableAsync(statement.Table)
-            : await _database.CreateRelationalTableAsync(statement.Schema);
+        var created = statement.VectorSchema is not null
+            ? await _database.CreateVectorTableAsync(statement.VectorSchema)
+            : statement.Schema is null
+                ? await _database.CreateTableAsync(statement.Table)
+                : await _database.CreateRelationalTableAsync(statement.Schema);
         if (_tableCoordinator is not null)
         {
             await _tableCoordinator.EnsureTableAsync(statement.Table);
             if (created)
             {
-                if (statement.Schema is null)
+                if (statement.VectorSchema is not null)
+                    await _tableCoordinator.EnsureVectorTableOnPeersAsync(statement.Table, statement.VectorSchema);
+                else if (statement.Schema is null)
                     await _tableCoordinator.EnsureTableOnPeersAsync(statement.Table);
                 else
                     await _tableCoordinator.EnsureRelationalTableOnPeersAsync(statement.Table, statement.Schema);
@@ -517,7 +521,7 @@ public sealed class SqlEngine
                 throw new SqlExecutionException("table leader election is not ready", StatusCodes.Status503ServiceUnavailable);
         }
         return SqlExecutionResult.Acknowledged(
-            statement.Schema is null ? "CREATE TABLE" : "CREATE RELATIONAL TABLE",
+            statement.VectorSchema is not null ? "CREATE VECTOR TABLE" : statement.Schema is null ? "CREATE TABLE" : "CREATE RELATIONAL TABLE",
             rowsAffected: created ? 1 : 0,
             message: created ? "table created" : "table already exists");
     }
@@ -547,6 +551,10 @@ public sealed class SqlEngine
             await _database.ValidateWriteAsync(table, key, value);
         }
         catch (RelationalSchemaException ex)
+        {
+            throw new SqlExecutionException(ex.Message);
+        }
+        catch (ArgumentException ex)
         {
             throw new SqlExecutionException(ex.Message);
         }

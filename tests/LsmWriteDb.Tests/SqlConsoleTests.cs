@@ -30,5 +30,10 @@ public sealed class SqlConsoleTests
         Assert.Contains("SELECT * FROM gold_users", html);
         Assert.Contains("CREATE INDEX idx_users_tier ON users (value.tier)", html);
         Assert.Contains("SELECT key, value FROM users WHERE value.tier = 'gold' LIMIT 50", html);
+        Assert.Contains("Vector quickstart: click each Vector example in order", html);
+        Assert.Contains("data-query=\"CREATE TABLE VECTOR demo_vectors (embedding VECTOR(3))\"", html);
+        Assert.Contains("INSERT INTO demo_vectors VALUES ('item-1'", html);
+        Assert.Contains("embedding &lt;-&gt; '[1,0,0]'", html);
+        Assert.Contains("cosine distance", html);
     }
 }

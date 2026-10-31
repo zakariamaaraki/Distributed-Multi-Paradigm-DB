@@ -186,7 +186,7 @@ record is never split across blocks.
 - Use read-your-writes with selectable transaction isolation: read committed, repeatable read, and serializable. Repeatable read caches transaction reads; serializable uses a strict coarse-grained 2PL gate. Snapshot isolation remains unsupported.
 - Keep uncommitted transaction changes out of durable storage after a server crash.
 - Provide a modular SQL engine over the existing key/value and transaction APIs.
-- Support three compatible data paradigms: key/value, JSON document, and schema-enforced relational tables over the same storage engine.
+- Support four compatible data paradigms: key/value, JSON document, schema-enforced relational tables, and vector tables over the same storage engine.
 - Support SQL table creation, point reads, key range reads, inserts, updates,
   deletes, transaction control, and equality filters over JSON `value`
   documents or dot-path properties.
@@ -197,7 +197,7 @@ record is never split across blocks.
 - Support `USING FASTWRITE` exact-value indexes backed by the normal LSM/SSTable
   write path for high-ingest workloads.
 - Support inner equi-joins between tables on matching keys.
-- Support read-only SQL views stored as catalog metadata over key/value, document, and relational tables.
+- Support read-only SQL views stored as catalog metadata over key/value, document, relational, and vector tables.
 - Elect one leader per table with multiple followers and rebalance table ownership when replicas join or leave.
 - Publish committed change-log events so replicas and external consumers can
   replay changes or subscribe over Server-Sent Events from a known sequence
@@ -740,6 +740,169 @@ Supported column types are `TEXT`, `INT`, `BIGINT`, `BOOLEAN`, and `DOUBLE`.
 Existing `CREATE TABLE` tables remain schemaless and keep their current behavior.
 See [the relational-table design](./design/relational-tables.md) for catalog
 format, validation rules, and current limitations.
+
+### Vector tables
+
+Vector tables keep embeddings in ordinary JSON rows and maintain a derived
+HNSW index on each replica. The index is rebuilt from LSM rows during startup.
+Vectors must have the declared dimension and contain only finite numbers.
+
+```sql
+CREATE TABLE VECTOR documents (embedding VECTOR(3));
+INSERT INTO documents VALUES ('doc-1', '{"embedding":[0.1,0.2,0.3],"text":"example"}');
+SELECT key, value FROM documents ORDER BY embedding <-> '[0.1,0.2,0.25]' LIMIT 10;
+```
+
+Search uses cosine distance and returns `key`, `value`, and `distance`.
+`efSearch` currently defaults to at least 64; increasing it explores more of the
+graph and can improve recall at the cost of query time.
+
+#### Neighbor-search algorithm choices
+
+KNN describes the task of ranking vectors by distance. An exact flat scan checks
+every vector, while approximate nearest-neighbor (ANN) indexes inspect a smaller
+candidate set and trade some recall for lower latency.
+
+| Algorithm | Search tradeoff | Write and storage tradeoff |
+| --- | --- | --- |
+| Exact KNN / flat scan | Exact results; distance work grows linearly with row count | No graph to maintain and little index memory, but every query scans the collection |
+| HNSW | Approximate graph traversal; usually strong recall with low query latency | Supports incremental inserts; the graph uses substantial RAM, and deletes leave tombstones until rebuild |
+| IVF-Flat | Searches selected centroid buckets; recall is tuned by probing more buckets | Requires centroid training and possible retraining; vectors remain uncompressed |
+| IVF-PQ | Compressed approximate distances reduce memory and scan cost | Requires training codebooks and accepts additional distance error |
+| LSH | Hash buckets produce approximate candidates | Incremental updates are straightforward, but recall depends on hash tables and probes |
+| Annoy / random projection trees | Fast approximate traversal, suited to read-heavy collections | Primarily build-oriented; frequent updates commonly need rebuilds |
+| DiskANN | Graph search designed to keep more of a large index on SSD | Reduces RAM pressure, with more complex SSD and graph maintenance |
+
+This database uses HNSW because it can accept writes incrementally, which fits
+the write-heavy workload better than build-oriented indexes such as Annoy. It
+does not require a training phase like IVF, and avoids the extra quantization
+error and codebook lifecycle of IVF-PQ. Its memory use is the main cost. The
+LSM row remains authoritative; the per-replica HNSW graph is a derived,
+in-memory index rebuilt from table rows at startup. This keeps crash recovery
+simple, at the cost of startup rebuild time and memory proportional to the
+indexed vectors. Search is approximate, and the current implementation uses
+cosine distance only. It does not yet provide metadata filtering during graph
+traversal or a persistent graph snapshot.
+
+For a production-sized collection, compare recall@k, p50/p95 query latency,
+insert throughput, memory per vector, and restart rebuild time against exact
+scan and IVF-Flat using representative embeddings. See
+[the vector-table design](./design/vector-tables.md) for lifecycle details and
+additional limitations.
+
+#### HNSW implementation internals
+
+The durable representation is still the ordinary table row. The row key is the
+vector ID, and the JSON `value` contains the embedding and any application data.
+WAL, memtables, SSTables, change-log replication, and table snapshots store or
+transfer those rows through the existing LSM paths. **The HNSW graph is not
+stored in SSTables:** it is a derived in-memory index maintained separately on
+each replica. The row remains authoritative if a process stops between a row
+write and its index update.
+
+Each in-memory node contains the row key, a `double[]` copy of its embedding, a
+deleted flag, and neighbor lists for the levels the node belongs to. The graph
+uses `M=16` and `efConstruction=200` by default. A new node receives a random
+level: each additional level is selected with probability `1/M`, so most nodes
+live only at level 0 and progressively fewer nodes appear on higher levels.
+The highest-level node is the graph entry point.
+
+On insert, HNSW starts at the entry point. It greedily follows a closer neighbor
+on levels above the new node's level, then searches each shared level with a
+construction candidate beam of `efConstruction`. It links the new node to up to
+`M` closest candidates and adds reciprocal links. When a node accumulates more
+than `2*M` neighbors at a level, the implementation keeps its `M` closest
+neighbors. A node placed above the previous maximum level becomes the new entry
+point. Updates mark the old node deleted and insert a replacement with the same
+row key.
+
+Search starts at the highest-level entry point and greedily moves to a closer
+neighbor, descending one level at a time. At level 0 it explores a candidate
+beam, ranks the candidates by cosine distance, and returns the best `k`. SQL
+sets the beam to `max(64, LIMIT)`. The beam is not a promise that exactly that
+many nodes are visited. The graph avoids scanning all rows in typical cases,
+but results are approximate and query cost/recall depend on graph shape and
+beam width. Distances for returned candidates are computed from their vectors;
+the approximation is in which candidates the graph finds.
+
+Cosine distance is calculated as `1 - dot(a,b) / (|a| * |b|)`. For nonzero
+vectors it is a floating-point value from 0 (same direction) through 1
+(orthogonal) to 2 (opposite direction). The implementation assigns distance 0
+when both vectors are zero and 1 when only one is zero. It validates that
+embeddings have the declared dimension and finite numeric components before
+indexing them.
+
+Deletes mark graph nodes as tombstones so traversal can still pass through
+them, but search filters them from results. Tombstones remain until a restart
+or index rebuild. At startup, the database scans the table's live LSM rows and
+recreates the graph; no graph snapshot is currently persisted. This trades
+simple recovery for startup work and RAM proportional to the collection. With
+the current `double[]` storage, 100,000 vectors of 768 dimensions use about
+586 MiB for the vector arrays alone, before node, edge, JSON row, and runtime
+overhead.
+
+##### Back-of-the-envelope memory sizing
+
+The embedding-array estimate is `row count × dimensions × 8 bytes`, because
+each component is stored as a 64-bit `double`. The table below converts that
+payload to MiB/GiB and excludes array headers, HNSW nodes and links, dictionaries,
+LSM buffers/cache, and the JSON rows themselves:
+
+| Vectors | Dimensions | Embedding arrays only |
+| ---: | ---: | ---: |
+| 10,000 | 768 | about 58.6 MiB |
+| 100,000 | 768 | about 586 MiB |
+| 100,000 | 1,536 | about 1.14 GiB |
+| 1,000,000 | 768 | about 5.72 GiB |
+
+For another rough scale check, `M=16` gives up to roughly 16–32 neighbor
+references per node at level 0 in this implementation. At 100,000 nodes, that
+is approximately 12–24 MiB of 8-byte references before higher-level links and
+the per-node `List<Node>` objects and backing arrays. This is only a graph-link
+estimate: actual degree and managed-heap overhead vary with the data and runtime.
+Plan RAM above the embedding-only figure, then measure the process with the
+intended dimensions, row count, and write/search mix before choosing a capacity.
+
+#### Vector SQL statements
+
+Vector tables use the following SQL forms. Run each statement separately in the
+SQL console:
+
+```sql
+CREATE TABLE VECTOR demo_vectors (embedding VECTOR(3));
+
+INSERT INTO demo_vectors (key, value)
+VALUES ('item-1', '{"embedding":[1,0,0],"label":"matched"}');
+
+SELECT key, value
+FROM demo_vectors
+ORDER BY embedding <-> '[1,0,0]'
+LIMIT 10;
+
+UPDATE demo_vectors
+SET value = '{"embedding":[0,0,1],"label":"updated"}'
+WHERE key = 'item-1';
+
+DELETE FROM demo_vectors WHERE key = 'item-1';
+DROP TABLE demo_vectors;
+```
+
+- `CREATE TABLE VECTOR name (embedding VECTOR(dimension))` creates a vector
+  table with one embedding column and a fixed dimension.
+- `INSERT INTO name (key, value) VALUES (...)` stores a row. Omitting the column
+  list uses the same `key, value` pair. `value` must be JSON with the declared
+  embedding property.
+- `SELECT ... FROM name ORDER BY embedding <-> '[...]' LIMIT k` performs ANN
+  search. The embedding column, query dimension, and `LIMIT` (1 through 10000)
+  are validated. Results currently contain `key`, `value`, and `distance`.
+- Point/range `SELECT` by key, `UPDATE ... SET value ... WHERE key = ...`,
+  `DELETE ... WHERE key = ...`, and `DROP TABLE` use the existing table SQL
+  behavior. Updates and deletes maintain the derived graph.
+- Search is cosine-only. SQL does not yet expose `efSearch`, metadata predicates
+  within ANN traversal, multiple embedding columns, or exact KNN mode. ANN
+  searches use committed index state; staged transaction writes become
+  searchable after commit.
+
 ### Views
 
 Views are read-only named `SELECT` queries stored in the table catalog. They
