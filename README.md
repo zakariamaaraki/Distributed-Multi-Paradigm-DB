@@ -803,12 +803,43 @@ stored in SSTables:** it is a derived in-memory index maintained separately on
 each replica. The row remains authoritative if a process stops between a row
 write and its index update.
 
-Each in-memory node contains the row key, a `double[]` copy of its embedding, a
-deleted flag, and neighbor lists for the levels the node belongs to. The graph
-uses `M=16` and `efConstruction=200` by default. A new node receives a random
-level: each additional level is selected with probability `1/M`, so most nodes
-live only at level 0 and progressively fewer nodes appear on higher levels.
-The highest-level node is the graph entry point.
+The relationship between durable storage and the in-memory index is:
+
+```mermaid
+flowchart LR
+    R["LSM row<br/>key: item-42<br/>value: JSON with embedding"]
+    D["HNSW node in memory<br/>id: item-42<br/>vector: double[]<br/>deleted flag<br/>neighbor lists by level"]
+    R -->|insert or startup rebuild| D
+    D -->|nearest-neighbor search| Q["candidate row IDs and distances"]
+    Q -->|fetch row values| R
+```
+
+The graph is a dictionary from row ID to node. Each node holds a `double[]`
+embedding and an array of neighbor lists, one list for each level the node
+occupies. Neighbor entries are references to other in-memory nodes. A deleted
+node is marked as a tombstone so traversal can still pass through it; search
+omits it from returned results.
+
+Here is a conceptual view of the same graph at three levels. Higher layers have
+fewer nodes and longer-range links; every node appears at level 0, while only
+some nodes appear in higher layers:
+
+```text
+Level 2:          A ───────────── E
+                   \               \
+Level 1:          A ── B ───────── E ── F
+                   \   \          /     \
+Level 0:          A ── B ── C ── D ── E ── F
+```
+
+The links shown are illustrative; insertion order and random level assignment
+determine the actual graph. The database persists the row, not this graph. At
+startup it scans the live rows and creates the graph again.
+
+Graph construction uses `M=16` and `efConstruction=200` by default. A new node
+receives a random level: each additional level is selected with probability
+`1/M`, so most nodes live only at level 0 and progressively fewer nodes appear
+on higher levels. The highest-level node is the graph entry point.
 
 On insert, HNSW starts at the entry point. It greedily follows a closer neighbor
 on levels above the new node's level, then searches each shared level with a
