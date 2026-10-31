@@ -2,17 +2,15 @@
 
 A distributed, write-optimized database built around one durable LSM storage engine. It exposes four data paradigms over the same data: key/value, JSON documents, SQL-shaped tables, and vector tables. Exact-value indexes and full-text search are additional capabilities over tables.
 
-The four supported data paradigms are:
+The four supported data paradigms and full-text search are:
 
 - **Key/value store**: opaque string values addressed by a string key. Use it for simple high-throughput reads and writes when the application owns the value format.
 - **Document database**: JSON documents addressed by a string key, with optional JSON property indexes and dot-path queries. Use it for flexible records whose shape can evolve without a fixed relational schema.
 - **Relational database**: schema-defined SQL tables whose rows are encoded as JSON internally, with the primary key kept as the physical table key. Use it when typed columns, primary keys, validation, SQL projections, joins, and transactions matter.
 - **Vector database**: fixed-dimension embeddings stored in JSON rows, with a derived HNSW index for approximate nearest-neighbor search. Use it for similarity search over embeddings; the graph is rebuilt from durable LSM rows at startup.
+- **Full-text search**: searchable text fields over ordinary tables, with phrase matching, AND/OR queries, and relevance ranking. It indexes existing rows rather than introducing another row model.
 
-Additional supported search capabilities:
-
-- **Exact-value indexes**: accelerate lookups over indexed values in existing tables.
-- **Full-text search**: search text fields over ordinary tables with phrase matching, AND/OR queries, and relevance ranking. It indexes existing rows rather than introducing another row model.
+Exact-value indexes are an additional capability that accelerates lookups over indexed values in existing tables.
 
 The central design rule is simple:
 
