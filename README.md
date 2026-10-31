@@ -1,13 +1,15 @@
 # Distributed Write-Heavy Database
 
-A distributed, write-optimized database built around one durable LSM storage engine. It exposes several ways to use the same data: key/value, JSON documents, SQL-shaped tables, exact-value indexes, and full-text search.
+A distributed, write-optimized database built around one durable LSM storage engine. It exposes four data paradigms over the same data: key/value, JSON documents, SQL-shaped tables, and vector tables. Exact-value indexes and full-text search are additional capabilities over tables.
 
 The four supported data paradigms are:
 
 - **Key/value store**: opaque string values addressed by a string key. Use it for simple high-throughput reads and writes when the application owns the value format.
 - **Document database**: JSON documents addressed by a string key, with optional JSON property indexes and dot-path queries. Use it for flexible records whose shape can evolve without a fixed relational schema.
 - **Relational database**: schema-defined SQL tables whose rows are encoded as JSON internally, with the primary key kept as the physical table key. Use it when typed columns, primary keys, validation, SQL projections, joins, and transactions matter.
-- **Full-text search**: searchable text fields over ordinary tables, backed by SSTable-based inverted indexes with phrase matching and relevance ranking. Use it for terms, phrases, AND/OR queries, and ranked search across document fields.
+- **Vector database**: fixed-dimension embeddings stored in JSON rows, with a derived HNSW index for approximate nearest-neighbor search. Use it for similarity search over embeddings; the graph is rebuilt from durable LSM rows at startup.
+
+Exact-value indexes and full-text search complement these four paradigms. They add indexed lookups and ranked text search over existing tables without introducing another row model.
 
 The central design rule is simple:
 
