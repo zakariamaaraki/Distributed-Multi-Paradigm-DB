@@ -1,8 +1,8 @@
 # Distributed Write-Heavy Database
 
-A distributed, write-optimized database built around one durable LSM storage engine. It exposes four data paradigms over the same data: key/value, JSON documents, SQL-shaped tables, and vector tables. Exact-value indexes and full-text search are additional capabilities over tables.
+A distributed, write-optimized database built around one durable LSM storage engine. It exposes five supported paradigms over the same data: key/value, JSON documents, SQL-shaped tables, vector tables, and full-text search. Exact-value indexes are an additional capability over tables.
 
-The four supported data paradigms and full-text search are:
+The five supported paradigms are:
 
 - **Key/value store**: opaque string values addressed by a string key. Use it for simple high-throughput reads and writes when the application owns the value format.
 - **Document database**: JSON documents addressed by a string key, with optional JSON property indexes and dot-path queries. Use it for flexible records whose shape can evolve without a fixed relational schema.
@@ -189,7 +189,7 @@ record is never split across blocks.
 - Use read-your-writes with selectable transaction isolation: read committed, repeatable read, and serializable. Repeatable read caches transaction reads; serializable uses a strict coarse-grained 2PL gate. Snapshot isolation remains unsupported.
 - Keep uncommitted transaction changes out of durable storage after a server crash.
 - Provide a modular SQL engine over the existing key/value and transaction APIs.
-- Support four compatible data paradigms: key/value, JSON document, schema-enforced relational tables, and vector tables over the same storage engine.
+- Support five compatible data paradigms and search modes: key/value, JSON document, schema-enforced relational tables, vector tables, and full-text search over the same storage engine.
 - Support SQL table creation, point reads, key range reads, inserts, updates,
   deletes, transaction control, and equality filters over JSON `value`
   documents or dot-path properties.
