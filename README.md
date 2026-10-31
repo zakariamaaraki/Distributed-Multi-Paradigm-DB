@@ -9,7 +9,10 @@ The four supported data paradigms are:
 - **Relational database**: schema-defined SQL tables whose rows are encoded as JSON internally, with the primary key kept as the physical table key. Use it when typed columns, primary keys, validation, SQL projections, joins, and transactions matter.
 - **Vector database**: fixed-dimension embeddings stored in JSON rows, with a derived HNSW index for approximate nearest-neighbor search. Use it for similarity search over embeddings; the graph is rebuilt from durable LSM rows at startup.
 
-Exact-value indexes and full-text search complement these four paradigms. They add indexed lookups and ranked text search over existing tables without introducing another row model.
+Additional supported search capabilities:
+
+- **Exact-value indexes**: accelerate lookups over indexed values in existing tables.
+- **Full-text search**: search text fields over ordinary tables with phrase matching, AND/OR queries, and relevance ranking. It indexes existing rows rather than introducing another row model.
 
 The central design rule is simple:
 
